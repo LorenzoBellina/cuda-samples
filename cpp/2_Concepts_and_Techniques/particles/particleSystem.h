@@ -125,14 +125,13 @@ public:
     void addSphere(int index, float *pos, float *vel, int r, float spacing);
 
     // Writes the per-phase GPU timings collected by update() (after warm-up) to filename as CSV,
-    // one row per (recorded frame, phase) pair: config,density,seed,num_particles,frame,phase,
+    // one row per (recorded frame, phase) pair: config,seed,num_particles,frame,phase,
     // time_ms,num_collisions. "phase" is one of integrate/hash/sort/reorder/collide; num_collisions
-    // is the same per-frame value repeated across that frame's 5 phase rows. density is
-    // informational only (not applied to the simulation); pass NAN to leave it blank. Appends to
+    // is the same per-frame value repeated across that frame's 5 phase rows. Appends to
     // filename if it already exists (so multiple runs/configs accumulate in one CSV for later
     // comparison) and only writes the header row for a brand-new file; creates any missing parent
     // directories.
-    void writeTimingCSV(const std::string &filename, const std::string &configLabel = "", float density = NAN) const;
+    void writeTimingCSV(const std::string &filename, const std::string &configLabel = "") const;
 
     // Sets the RNG seed used by initGrid() so the initial particle layout is reproducible.
     void setSeed(int seed) { m_seed = seed; }

@@ -146,11 +146,6 @@ char *g_configLabel = NULL;
 // RNG seed used for particle initialization (grid jitter / random cloud); set via --seed=<int>
 int g_seed = 1973;
 
-// Particle density value supplied via --density=<float>; not used by the simulation itself
-// (domain size and particle radius are fixed in this sample) -- logged and written to the
-// benchmark CSV so it can be correlated with externally-varied domain/particle setups.
-// NAN means "not set".
-float g_density = NAN; //CHECK COSA FARE CON DENSITY
 
 const char *sSDKsample = "CUDA Particles Simulation";
 
@@ -240,7 +235,7 @@ void runBenchmark(int iterations, char *exec_path)
            1,
            0);
 
-    psystem->writeTimingCSV("results/raw/particle_phase_timings.csv", g_configLabel ? g_configLabel : "", g_density);
+    psystem->writeTimingCSV("results/raw/particle_phase_timings.csv", g_configLabel ? g_configLabel : "");
 
     if (g_refFile) {
         printf("\nChecking result...\n\n");
@@ -759,10 +754,6 @@ int main(int argc, char **argv)
         if (checkCmdLineFlag(argc, (const char **)argv, "seed")) {
             g_seed = getCmdLineArgumentInt(argc, (const char **)argv, "seed");
         }
-
-        if (checkCmdLineFlag(argc, (const char **)argv, "density")) {
-            g_density = getCmdLineArgumentFloat(argc, (const char **)argv, "density");
-        }
     }
 
     gridSize.x = gridSize.y = gridSize.z = gridDim;
@@ -772,10 +763,6 @@ int main(int argc, char **argv)
 
     if (g_configLabel) {
         printf("config: %s\n", g_configLabel);
-    }
-
-    if (!std::isnan(g_density)) {
-        printf("density: %f (informational only; not applied to domain size or particle radius)\n", g_density);
     }
 
     bool benchmark = checkCmdLineFlag(argc, (const char **)argv, "benchmark") != 0;

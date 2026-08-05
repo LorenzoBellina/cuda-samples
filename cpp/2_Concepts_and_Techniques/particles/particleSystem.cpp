@@ -375,7 +375,7 @@ void ParticleSystem::update(float deltaTime)
 // in one cumulative CSV for later comparison) and only writes the header row for a brand-new
 // file. No-op (with a stderr warning) if the file can't be opened, or if no frames were
 // recorded yet (e.g. the run didn't exceed the warm-up window).
-void ParticleSystem::writeTimingCSV(const std::string &filename, const std::string &configLabel, float density) const
+void ParticleSystem::writeTimingCSV(const std::string &filename, const std::string &configLabel) const
 {
     const std::vector<float> &integrateMs = m_timingMs[TIMING_INTEGRATE];
 
@@ -403,16 +403,7 @@ void ParticleSystem::writeTimingCSV(const std::string &filename, const std::stri
     }
 
     if (!fileExists) {
-        fprintf(fp, "config,density,seed,num_particles,frame,phase,time_ms,num_collisions\n");
-    }
-
-    char densityField[32];
-
-    if (std::isnan(density)) {
-        densityField[0] = '\0';
-    }
-    else {
-        snprintf(densityField, sizeof(densityField), "%f", density);
+        fprintf(fp, "config,seed,num_particles,frame,phase,time_ms,num_collisions\n");
     }
 
     for (size_t i = 0; i < integrateMs.size(); ++i) {
@@ -420,9 +411,8 @@ void ParticleSystem::writeTimingCSV(const std::string &filename, const std::stri
 
         for (int p = 0; p < TIMING_NUM_PHASES; ++p) {
             fprintf(fp,
-                    "\"%s\",%s,%d,%u,%zu,%s,%f,%u\n",
+                    "\"%s\",%d,%u,%zu,%s,%f,%u\n",
                     configLabel.c_str(),
-                    densityField,
                     m_seed,
                     m_numParticles,
                     i,
