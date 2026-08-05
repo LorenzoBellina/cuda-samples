@@ -60,6 +60,7 @@
 
 // Includes
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdlib.h>
@@ -67,6 +68,9 @@
 #include "paramgl.h"
 #include "particleSystem.h"
 #include "render_particles.h"
+
+// Ensure CUDA vector types are available for headers that depend on them
+#include <vector_types.h>
 
 #define MAX_EPSILON_ERROR 5.00f
 #define THRESHOLD         0.30f
@@ -135,16 +139,31 @@ unsigned int frameCount       = 0;
 unsigned int g_TotalErrors    = 0;
 char        *g_refFile        = NULL;
 
+// free-form label written into the benchmark CSV to identify the current configuration
+// (e.g. "baseline", "atomic", "shared_mem"); set via --config=<name>
+char *g_configLabel = NULL;
+
+// RNG seed used for particle initialization (grid jitter / random cloud); set via --seed=<int>
+int g_seed = 1973;
+
+// Particle density value supplied via --density=<float>; not used by the simulation itself
+// (domain size and particle radius are fixed in this sample) -- logged and written to the
+// benchmark CSV so it can be correlated with externally-varied domain/particle setups.
+// NAN means "not set".
+float g_density = NAN; //CHECK COSA FARE CON DENSITY
+
 const char *sSDKsample = "CUDA Particles Simulation";
 
 extern "C" void cudaInit(int argc, char **argv);
 extern "C" void cudaGLInit(int argc, char **argv);
 extern "C" void copyArrayFromDevice(void *host, const void *device, unsigned int vbo, int size);
 
-// initialize particle system
+// Creates the global ParticleSystem (and, if using OpenGL, its ParticleRenderer), resets it
+// to a regular grid layout, and starts the FPS timer.
 void initParticleSystem(int numParticles, uint3 gridSize, bool bUseOpenGL)
 {
     psystem = new ParticleSystem(numParticles, gridSize, bUseOpenGL);
+    psystem->setSeed(g_seed);
     psystem->reset(ParticleSystem::CONFIG_GRID);
 
     if (bUseOpenGL) {
@@ -156,6 +175,7 @@ void initParticleSystem(int numParticles, uint3 gridSize, bool bUseOpenGL)
     sdkCreateTimer(&timer);
 }
 
+// GLUT close callback: destroys the FPS timer and the global ParticleSystem.
 void cleanup()
 {
     sdkDeleteTimer(&timer);
@@ -166,7 +186,8 @@ void cleanup()
     return;
 }
 
-// initialize OpenGL
+// Creates the GLUT window, verifies the required OpenGL version/extensions are available
+// (exiting if not), disables v-sync on Windows, and sets up basic GL state.
 void initGL(int *argc, char **argv)
 {
     glutInit(argc, argv);
@@ -194,6 +215,9 @@ void initGL(int *argc, char **argv)
     glutReportErrors();
 }
 
+// Runs the simulation for the given number of iterations with no rendering, timing the run
+// to report throughput, and (if a reference file was supplied via -file=) dumps the final
+// positions and compares them against that reference to validate correctness.
 void runBenchmark(int iterations, char *exec_path)
 {
     printf("Run %u particles simulation for %d iterations...\n\n", numParticles, iterations);
@@ -216,6 +240,8 @@ void runBenchmark(int iterations, char *exec_path)
            1,
            0);
 
+    psystem->writeTimingCSV("results/raw/particle_phase_timings.csv", g_configLabel ? g_configLabel : "", g_density);
+
     if (g_refFile) {
         printf("\nChecking result...\n\n");
         float *hPos = (float *)malloc(sizeof(float) * 4 * psystem->getNumParticles());
@@ -230,6 +256,8 @@ void runBenchmark(int iterations, char *exec_path)
     }
 }
 
+// Updates the frame counter and, once fpsLimit frames have elapsed, recomputes and displays
+// the current frames-per-second in the window title.
 void computeFPS()
 {
     frameCount++;
@@ -248,6 +276,9 @@ void computeFPS()
     }
 }
 
+// GLUT display callback: pushes current UI-controlled parameters into the simulation,
+// steps it forward by one timestep (unless paused), then renders the domain wireframe cube,
+// the collider sphere, the particles themselves, and (if enabled) the parameter sliders.
 void display()
 {
     sdkStartTimer(&timer);
@@ -320,8 +351,11 @@ void display()
     computeFPS();
 }
 
+// Returns a pseudo-random float uniformly distributed in [0, 1).
 inline float frand() { return rand() / (float)RAND_MAX; }
 
+// Injects a new sphere of ballr-radius particles at a random position near the top of the
+// simulation domain, with zero initial velocity.
 void addSphere()
 {
     // inject a sphere of particles
@@ -336,6 +370,8 @@ void addSphere()
     psystem->addSphere(0, pos, vel, ballr, pr * 2.0f);
 }
 
+// GLUT reshape callback: rebuilds the perspective projection and viewport for the new window
+// size and informs the renderer of the new size/FOV (used to scale point-sprite size).
 void reshape(int w, int h)
 {
     glMatrixMode(GL_PROJECTION);
@@ -351,6 +387,8 @@ void reshape(int w, int h)
     }
 }
 
+// GLUT mouse-button callback: tracks which button(s) are held (adjusted for shift/ctrl
+// modifiers) and forwards the event to the parameter-slider UI if it's visible.
 void mouse(int button, int state, int x, int y)
 {
     int mods;
@@ -387,7 +425,7 @@ void mouse(int button, int state, int x, int y)
     glutPostRedisplay();
 }
 
-// transform vector by matrix
+// Transforms vector v by 4x4 matrix m (column-major, OpenGL convention), writing the result to r.
 void xform(float *v, float *r, GLfloat *m)
 {
     r[0] = v[0] * m[0] + v[1] * m[4] + v[2] * m[8] + m[12];
@@ -395,7 +433,9 @@ void xform(float *v, float *r, GLfloat *m)
     r[2] = v[0] * m[2] + v[1] * m[6] + v[2] * m[10] + m[14];
 }
 
-// transform vector by transpose of matrix
+// Transforms direction vector v by the transpose (inverse rotation, for an orthonormal
+// matrix) of the upper 3x3 of m, writing the result to r; used to map a screen-space drag
+// direction into world space.
 void ixform(float *v, float *r, GLfloat *m)
 {
     r[0] = v[0] * m[0] + v[1] * m[1] + v[2] * m[2];
@@ -403,6 +443,8 @@ void ixform(float *v, float *r, GLfloat *m)
     r[2] = v[0] * m[8] + v[1] * m[9] + v[2] * m[10];
 }
 
+// Transforms world-space point v by the inverse of view matrix m (translates by -m's
+// translation, then applies ixform's inverse rotation), writing the result to r.
 void ixformPoint(float *v, float *r, GLfloat *m)
 {
     float x[4];
@@ -413,6 +455,9 @@ void ixformPoint(float *v, float *r, GLfloat *m)
     ixform(x, r, m);
 }
 
+// GLUT mouse-motion callback: in M_VIEW mode, updates camera rotation/translation/zoom from
+// the drag delta and button state; in M_MOVE mode, drags the interactive collider sphere
+// through the scene instead. Also forwards drags to the slider UI when it is visible.
 void motion(int x, int y)
 {
     float dx, dy;
@@ -485,6 +530,9 @@ void motion(int x, int y)
     glutPostRedisplay();
 }
 
+// GLUT keyboard callback: dispatches single-key shortcuts for pausing/stepping the
+// simulation, switching camera/collider-move mode, toggling point vs. sphere rendering,
+// resetting to a grid/random layout, injecting spheres, dumping debug info, and quitting.
 // commented out to remove unused parameter warnings in Linux
 void key(unsigned char key, int /*x*/, int /*y*/)
 {
@@ -580,6 +628,8 @@ void key(unsigned char key, int /*x*/, int /*y*/)
     glutPostRedisplay();
 }
 
+// GLUT special-key (arrow/function key) callback: forwards the event to the parameter-slider
+// UI when it is visible, and cancels demo mode.
 void special(int k, int x, int y)
 {
     if (displaySliders) {
@@ -590,6 +640,9 @@ void special(int k, int x, int y)
     idleCounter = 0;
 }
 
+// GLUT idle callback: after a period of user inactivity, enters an automatic "demo mode"
+// that spins the camera and periodically injects new spheres of particles; always requests
+// a redraw of the next frame.
 void idle(void)
 {
     if ((idleCounter++ > idleDelay) && (demoMode == false)) {
@@ -610,6 +663,9 @@ void idle(void)
     glutPostRedisplay();
 }
 
+// When validating against a reference file, zeroes out all randomness/forces for a
+// deterministic run; otherwise builds the on-screen ParamListGL slider UI bound to the
+// simulation's tunable parameters (timestep, damping, gravity, collision coefficients, etc).
 void initParams()
 {
     if (g_refFile) {
@@ -638,8 +694,11 @@ void initParams()
     }
 }
 
+// Right-click context-menu callback: reuses the keyboard handler so each menu entry behaves
+// exactly like pressing its associated key.
 void mainMenu(int i) { key((unsigned char)i, 0, 0); }
 
+// Builds the right-click context menu, mapping each entry to the keyboard shortcut it mirrors.
 void initMenus()
 {
     glutCreateMenu(mainMenu);
@@ -659,6 +718,10 @@ void initMenus()
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
+// Entry point: parses command-line options (particle count, grid size, benchmark mode,
+// reference-file comparison, iteration count), initializes CUDA (and OpenGL/GLUT unless
+// running headless benchmark/validation), creates the particle system, then either runs a
+// fixed-iteration benchmark/validation pass or enters the interactive GLUT main loop.
 int main(int argc, char **argv)
 {
 #if defined(__linux__)
@@ -688,11 +751,32 @@ int main(int argc, char **argv)
             fpsLimit      = frameCheckNumber;
             numIterations = 1;
         }
+
+        if (checkCmdLineFlag(argc, (const char **)argv, "config")) {
+            getCmdLineArgumentString(argc, (const char **)argv, "config", &g_configLabel);
+        }
+
+        if (checkCmdLineFlag(argc, (const char **)argv, "seed")) {
+            g_seed = getCmdLineArgumentInt(argc, (const char **)argv, "seed");
+        }
+
+        if (checkCmdLineFlag(argc, (const char **)argv, "density")) {
+            g_density = getCmdLineArgumentFloat(argc, (const char **)argv, "density");
+        }
     }
 
     gridSize.x = gridSize.y = gridSize.z = gridDim;
     printf("grid: %d x %d x %d = %d cells\n", gridSize.x, gridSize.y, gridSize.z, gridSize.x * gridSize.y * gridSize.z);
     printf("particles: %d\n", numParticles);
+    printf("seed: %d\n", g_seed);
+
+    if (g_configLabel) {
+        printf("config: %s\n", g_configLabel);
+    }
+
+    if (!std::isnan(g_density)) {
+        printf("density: %f (informational only; not applied to domain size or particle radius)\n", g_density);
+    }
 
     bool benchmark = checkCmdLineFlag(argc, (const char **)argv, "benchmark") != 0;
 

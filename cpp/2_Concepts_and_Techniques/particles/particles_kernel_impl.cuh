@@ -52,15 +52,36 @@ namespace cg = cooperative_groups;
 // simulation parameters in constant memory
 __constant__ SimParams cudaParams;
 
+// Instrumentation-only collision counter feeding the num_collisions column of the benchmark
+// CSV (see ParticleSystem::writeTimingCSV / collide() in particleSystem_cuda.cu). A single
+// atomicAdd per detected particle-particle overlap is negligible next to the rest of the
+// collision kernel, so it stays ON by default (including in --benchmark mode). To exclude it
+// from "clean" (non-instrumented) builds, define COUNT_COLLISIONS=0 for the compiler
+// (e.g. nvcc -DCOUNT_COLLISIONS=0), which compiles the counter and its atomics out entirely.
+#ifndef COUNT_COLLISIONS
+#define COUNT_COLLISIONS 1
+#endif
+
+#if COUNT_COLLISIONS
+__device__ unsigned int d_collisionCount;
+#endif
+
+// Thrust functor (applied per-particle via for_each over zipped position/velocity iterators)
+// that performs the Euler integration step of the simulation.
 struct integrate_functor
 {
     float deltaTime;
 
+    // Captures the timestep to integrate over.
     __host__ __device__ integrate_functor(float delta_time)
         : deltaTime(delta_time)
     {
     }
 
+    // Given a (position, velocity) tuple t, applies gravity and global damping to the
+    // velocity, advances the position by velocity * deltaTime, clamps the particle to stay
+    // within the [-1,1] cube (damping the velocity component on bounce), and writes the
+    // updated position/velocity back into t.
     template <typename Tuple> __device__ void operator()(Tuple t)
     {
         volatile float4 posData = cuda::std::get<0>(t);
@@ -115,7 +136,8 @@ struct integrate_functor
     }
 };
 
-// calculate position in uniform grid
+// Converts a world-space position p into (x,y,z) integer coordinates of the uniform grid
+// cell that contains it, relative to worldOrigin and scaled by cellSize.
 __device__ int3 calcGridPos(float3 p)
 {
     int3 gridPos;
@@ -125,7 +147,8 @@ __device__ int3 calcGridPos(float3 p)
     return gridPos;
 }
 
-// calculate address in grid from position (clamping to edges)
+// Wraps gridPos's coordinates into the grid bounds (grid size is assumed to be a power of two,
+// so wrapping is a bitmask) and flattens them into a single linear cell hash/index.
 __device__ uint calcGridHash(int3 gridPos)
 {
     gridPos.x = gridPos.x & (cudaParams.gridSize.x - 1); // wrap grid, assumes size is power of 2
@@ -135,7 +158,9 @@ __device__ uint calcGridHash(int3 gridPos)
          + __umul24(gridPos.y, cudaParams.gridSize.x) + gridPos.x;
 }
 
-// calculate grid hash value for each particle
+// Kernel: for each particle (one thread per particle), computes the grid cell it currently
+// occupies and writes out that cell's hash plus the particle's own index; these paired
+// arrays are subsequently sorted by hash to group particles by cell.
 __global__ void calcHashD(uint   *gridParticleHash,  // output
                           uint   *gridParticleIndex, // output
                           float4 *pos,               // input: positions
@@ -157,8 +182,11 @@ __global__ void calcHashD(uint   *gridParticleHash,  // output
     gridParticleIndex[index] = index;
 }
 
-// rearrange particle data into sorted order, and find the start of each cell
-// in the sorted hash array
+// Kernel: given particles already sorted by grid-cell hash (gridParticleHash/gridParticleIndex),
+// reorders their position/velocity data into that sorted order (sortedPos/sortedVel) and records,
+// for each grid cell, the index range [cellStart, cellEnd) of particles belonging to it. Uses
+// shared memory to let each thread compare its hash against its immediate neighbor's hash
+// (loaded once per block) rather than every thread re-reading two global-memory hash values.
 __global__ void reorderDataAndFindCellStartD(uint   *cellStart,         // output: cell start index
                                              uint   *cellEnd,           // output: cell end index
                                              float4 *sortedPos,         // output: sorted positions
@@ -221,7 +249,10 @@ __global__ void reorderDataAndFindCellStartD(uint   *cellStart,         // outpu
     }
 }
 
-// collide two spheres using DEM method
+// Computes the Discrete Element Method (DEM) contact force between two spheres A and B
+// (given their positions, velocities, and radii): zero if they don't overlap, otherwise a
+// spring force pushing them apart, a damping force opposing relative motion, a tangential
+// shear force, and an attraction term pulling them together. Returns the force to apply to A.
 __device__ float3
 collideSpheres(float3 posA, float3 posB, float3 velA, float3 velB, float radiusA, float radiusB, float attraction)
 {
@@ -255,7 +286,11 @@ collideSpheres(float3 posA, float3 posB, float3 velA, float3 velB, float radiusA
     return force;
 }
 
-// collide a particle against all other particles in a given cell
+// Accumulates the total DEM collision force on particle `index` (at position pos, velocity
+// vel) from every other particle located in the single grid cell gridPos. Looks up the
+// cell's particle range via cellStart/cellEnd (both read from global memory) and reads each
+// candidate neighbor's position/velocity directly out of the global oldPos/oldVel arrays
+// (sorted by cell) rather than staging them in shared memory.
 __device__ float3 collideCell(int3    gridPos,
                               uint    index,
                               float3  pos,
@@ -283,6 +318,17 @@ __device__ float3 collideCell(int3    gridPos,
                 float3 pos2 = make_float3(oldPos[j]);
                 float3 vel2 = make_float3(oldVel[j]);
 
+#if COUNT_COLLISIONS
+                // Instrumentation only: re-checks the same overlap predicate collideSpheres()
+                // uses internally, just to count events for the CSV. Each thread scans its
+                // neighbors independently, so an overlapping pair is counted twice (once from
+                // each particle's side) -- consistent with how the force computation below
+                // also revisits every pair from both sides.
+                if (length(pos2 - pos) < (cudaParams.particleRadius + cudaParams.particleRadius)) {
+                    atomicAdd(&d_collisionCount, 1u);
+                }
+#endif
+
                 // collide two spheres
                 force += collideSpheres(
                     pos, pos2, vel, vel2, cudaParams.particleRadius, cudaParams.particleRadius, cudaParams.attraction);
@@ -293,6 +339,11 @@ __device__ float3 collideCell(int3    gridPos,
     return force;
 }
 
+// Kernel: one thread per particle. Reads the particle's sorted position/velocity, determines
+// its grid cell, then examines all 27 neighboring cells (3x3x3 block, itself included) via
+// collideCell to accumulate particle-particle collision forces, plus one extra collision
+// check against the interactive collider sphere. The resulting velocity is written back to
+// newVel at the particle's original (pre-sort) index via gridParticleIndex.
 __global__ void collideD(float4 *newVel,            // output: new velocity
                          float4 *oldPos,            // input: sorted positions
                          float4 *oldVel,            // input: sorted velocities

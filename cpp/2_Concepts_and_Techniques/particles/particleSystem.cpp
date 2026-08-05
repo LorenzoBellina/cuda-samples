@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <filesystem>
 #include <helper_cuda.h>
 #include <helper_functions.h>
 #include <helper_gl.h>
@@ -31,6 +32,8 @@
 #define CUDART_PI_F 3.141592654f
 #endif
 
+// Constructs the simulation: stores the requested particle count and grid size, sets the
+// default physical/collision parameters, then allocates host/device buffers via _initialize().
 ParticleSystem::ParticleSystem(uint numParticles, uint3 gridSize, bool bUseOpenGL)
     : m_bInitialized(false)
     , m_bUseOpenGL(bUseOpenGL)
@@ -42,6 +45,7 @@ ParticleSystem::ParticleSystem(uint numParticles, uint3 gridSize, bool bUseOpenG
     , m_gridSize(gridSize)
     , m_timer(NULL)
     , m_solverIterations(1)
+    , m_frameIndex(0)
 {
     m_numGridCells = m_gridSize.x * m_gridSize.y * m_gridSize.z;
     //    float3 worldSize = make_float3(2.0f, 2.0f, 2.0f);
@@ -75,12 +79,14 @@ ParticleSystem::ParticleSystem(uint numParticles, uint3 gridSize, bool bUseOpenG
     _initialize(numParticles);
 }
 
+// Destroys the simulation, releasing every host/device buffer allocated for it.
 ParticleSystem::~ParticleSystem()
 {
     _finalize();
     m_numParticles = 0;
 }
 
+// Allocates an OpenGL array buffer of the given byte size and returns its handle.
 uint ParticleSystem::createVBO(uint size)
 {
     GLuint vbo;
@@ -91,9 +97,11 @@ uint ParticleSystem::createVBO(uint size)
     return vbo;
 }
 
+// Linearly interpolates between a and b by fraction t.
 inline float lerp(float a, float b, float t) { return a + t * (b - a); }
 
-// create a color ramp
+// Maps t in [0,1] onto a rainbow gradient (red -> orange -> yellow -> green -> cyan -> blue -> magenta),
+// writing the interpolated RGB result into r.
 void colorRamp(float t, float *r)
 {
     const int ncolors       = 7;
@@ -142,6 +150,10 @@ void colorRamp(float t, float *r)
     r[2]    = lerp(c[i][2], c[i + 1][2], u);
 }
 
+// Allocates host arrays (positions, velocities, cell start/end tables) and their device
+// counterparts (including sorted-position/velocity and grid-hash scratch buffers), creates
+// the position/color VBOs (or plain CUDA buffers when not using OpenGL), and uploads
+// the simulation parameters to constant memory.
 void ParticleSystem::_initialize(int numParticles)
 {
     assert(!m_bInitialized);
@@ -212,11 +224,18 @@ void ParticleSystem::_initialize(int numParticles)
 
     sdkCreateTimer(&m_timer);
 
+    for (int p = 0; p < TIMING_NUM_PHASES; ++p) {
+        checkCudaErrors(cudaEventCreate(&m_timingStart[p]));
+        checkCudaErrors(cudaEventCreate(&m_timingStop[p]));
+    }
+
     setParameters(&m_params);
 
     m_bInitialized = true;
 }
 
+// Frees every host and device buffer allocated in _initialize(), and deletes/unregisters
+// the OpenGL VBOs (or frees the plain CUDA buffers) depending on m_bUseOpenGL.
 void ParticleSystem::_finalize()
 {
     assert(m_bInitialized);
@@ -235,6 +254,11 @@ void ParticleSystem::_finalize()
     freeArray(m_dCellStart);
     freeArray(m_dCellEnd);
 
+    for (int p = 0; p < TIMING_NUM_PHASES; ++p) {
+        checkCudaErrors(cudaEventDestroy(m_timingStart[p]));
+        checkCudaErrors(cudaEventDestroy(m_timingStop[p]));
+    }
+
     if (m_bUseOpenGL) {
         unregisterGLBufferObject(m_cuda_colorvbo_resource);
         unregisterGLBufferObject(m_cuda_posvbo_resource);
@@ -247,7 +271,10 @@ void ParticleSystem::_finalize()
     }
 }
 
-// step the simulation
+// Advances the simulation by one step of deltaTime: integrates positions/velocities under
+// gravity and damping, recomputes each particle's grid cell hash, sorts particles by hash,
+// reorders position/velocity data into sorted order and finds each cell's start/end range,
+// then resolves particle-particle and particle-collider collisions.
 void ParticleSystem::update(float deltaTime)
 {
     assert(m_bInitialized);
@@ -264,17 +291,34 @@ void ParticleSystem::update(float deltaTime)
     // update constants
     setParameters(&m_params);
 
+    const bool bRecordTiming = (m_frameIndex >= kTimingWarmupFrames); //skips the first 20 frames
+    float      phaseMs[TIMING_NUM_PHASES];
+
     // integrate
+    checkCudaErrors(cudaEventRecord(m_timingStart[TIMING_INTEGRATE]));
     integrateSystem(dPos, m_dVel, deltaTime, m_numParticles);
+    checkCudaErrors(cudaEventRecord(m_timingStop[TIMING_INTEGRATE]));
+    checkCudaErrors(cudaEventSynchronize(m_timingStop[TIMING_INTEGRATE]));
+    checkCudaErrors(
+        cudaEventElapsedTime(&phaseMs[TIMING_INTEGRATE], m_timingStart[TIMING_INTEGRATE], m_timingStop[TIMING_INTEGRATE]));
 
     // calculate grid hash
+    checkCudaErrors(cudaEventRecord(m_timingStart[TIMING_HASH]));
     calcHash(m_dGridParticleHash, m_dGridParticleIndex, dPos, m_numParticles);
+    checkCudaErrors(cudaEventRecord(m_timingStop[TIMING_HASH]));
+    checkCudaErrors(cudaEventSynchronize(m_timingStop[TIMING_HASH]));
+    checkCudaErrors(cudaEventElapsedTime(&phaseMs[TIMING_HASH], m_timingStart[TIMING_HASH], m_timingStop[TIMING_HASH]));
 
     // sort particles based on hash
+    checkCudaErrors(cudaEventRecord(m_timingStart[TIMING_SORT]));
     sortParticles(m_dGridParticleHash, m_dGridParticleIndex, m_numParticles);
+    checkCudaErrors(cudaEventRecord(m_timingStop[TIMING_SORT]));
+    checkCudaErrors(cudaEventSynchronize(m_timingStop[TIMING_SORT]));
+    checkCudaErrors(cudaEventElapsedTime(&phaseMs[TIMING_SORT], m_timingStart[TIMING_SORT], m_timingStop[TIMING_SORT]));
 
     // reorder particle arrays into sorted order and
     // find start and end of each cell
+    checkCudaErrors(cudaEventRecord(m_timingStart[TIMING_REORDER]));
     reorderDataAndFindCellStart(m_dCellStart,
                                 m_dCellEnd,
                                 m_dSortedPos,
@@ -285,8 +329,14 @@ void ParticleSystem::update(float deltaTime)
                                 m_dVel,
                                 m_numParticles,
                                 m_numGridCells);
+    checkCudaErrors(cudaEventRecord(m_timingStop[TIMING_REORDER]));
+    checkCudaErrors(cudaEventSynchronize(m_timingStop[TIMING_REORDER]));
+    checkCudaErrors(
+        cudaEventElapsedTime(&phaseMs[TIMING_REORDER], m_timingStart[TIMING_REORDER], m_timingStop[TIMING_REORDER]));
 
     // process collisions
+    unsigned int frameCollisions = 0;
+    checkCudaErrors(cudaEventRecord(m_timingStart[TIMING_COLLIDE]));
     collide(m_dVel,
             m_dSortedPos,
             m_dSortedVel,
@@ -294,7 +344,24 @@ void ParticleSystem::update(float deltaTime)
             m_dCellStart,
             m_dCellEnd,
             m_numParticles,
-            m_numGridCells);
+            m_numGridCells,
+            &frameCollisions);
+    checkCudaErrors(cudaEventRecord(m_timingStop[TIMING_COLLIDE]));
+    checkCudaErrors(cudaEventSynchronize(m_timingStop[TIMING_COLLIDE]));
+    checkCudaErrors(
+        cudaEventElapsedTime(&phaseMs[TIMING_COLLIDE], m_timingStart[TIMING_COLLIDE], m_timingStop[TIMING_COLLIDE]));
+
+    // discard warm-up iterations from the recorded measurements only; the simulation itself
+    // still runs unmodified for every frame above
+    if (bRecordTiming) {
+        for (int p = 0; p < TIMING_NUM_PHASES; ++p) {
+            m_timingMs[p].push_back(phaseMs[p]);
+        }
+
+        m_collisionCounts.push_back(frameCollisions);
+    }
+
+    ++m_frameIndex;
 
     // note: do unmap at end here to avoid unnecessary graphics/CUDA context switch
     if (m_bUseOpenGL) {
@@ -302,6 +369,74 @@ void ParticleSystem::update(float deltaTime)
     }
 }
 
+// Writes the accumulated per-phase timings (populated by update(), excluding warm-up frames)
+// to filename as CSV, one row per (recorded frame, phase) pair. Creates any missing parent
+// directories; appends to filename if it already exists (so multiple runs/configs accumulate
+// in one cumulative CSV for later comparison) and only writes the header row for a brand-new
+// file. No-op (with a stderr warning) if the file can't be opened, or if no frames were
+// recorded yet (e.g. the run didn't exceed the warm-up window).
+void ParticleSystem::writeTimingCSV(const std::string &filename, const std::string &configLabel, float density) const
+{
+    const std::vector<float> &integrateMs = m_timingMs[TIMING_INTEGRATE];
+
+    if (integrateMs.empty()) {
+        fprintf(stderr, "writeTimingCSV: no timing samples recorded, skipping %s\n", filename.c_str());
+        return;
+    }
+
+    static const char *const kPhaseNames[TIMING_NUM_PHASES] = {"integrate", "hash", "sort", "reorder", "collide"};
+
+    std::filesystem::path filePath(filename);
+
+    if (filePath.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(filePath.parent_path(), ec);
+    }
+
+    bool fileExists = std::filesystem::exists(filePath);
+
+    FILE *fp = fopen(filename.c_str(), "a");
+
+    if (!fp) {
+        fprintf(stderr, "writeTimingCSV: unable to open %s for writing\n", filename.c_str());
+        return;
+    }
+
+    if (!fileExists) {
+        fprintf(fp, "config,density,seed,num_particles,frame,phase,time_ms,num_collisions\n");
+    }
+
+    char densityField[32];
+
+    if (std::isnan(density)) {
+        densityField[0] = '\0';
+    }
+    else {
+        snprintf(densityField, sizeof(densityField), "%f", density);
+    }
+
+    for (size_t i = 0; i < integrateMs.size(); ++i) {
+        unsigned int collisions = (i < m_collisionCounts.size()) ? m_collisionCounts[i] : 0;
+
+        for (int p = 0; p < TIMING_NUM_PHASES; ++p) {
+            fprintf(fp,
+                    "\"%s\",%s,%d,%u,%zu,%s,%f,%u\n",
+                    configLabel.c_str(),
+                    densityField,
+                    m_seed,
+                    m_numParticles,
+                    i,
+                    kPhaseNames[p],
+                    m_timingMs[p][i],
+                    collisions);
+        }
+    }
+
+    fclose(fp);
+}
+
+// Downloads the cell start/end tables to the host and prints the largest occupancy found
+// in any single grid cell; useful for sanity-checking the spatial hash and grid resolution.
 void ParticleSystem::dumpGrid()
 {
     // dump grid information
@@ -323,6 +458,8 @@ void ParticleSystem::dumpGrid()
     printf("maximum particles per cell = %d\n", maxCellSize);
 }
 
+// Downloads position and velocity for count particles starting at start and prints them
+// to stdout; a debugging aid for inspecting simulation state.
 void ParticleSystem::dumpParticles(uint start, uint count)
 {
     // debug
@@ -344,6 +481,8 @@ void ParticleSystem::dumpParticles(uint start, uint count)
     }
 }
 
+// Copies the requested device array (POSITION or VELOCITY) into its matching host buffer
+// and returns a pointer to that host buffer.
 float *ParticleSystem::getArray(ParticleArray array)
 {
     assert(m_bInitialized);
@@ -370,6 +509,9 @@ float *ParticleSystem::getArray(ParticleArray array)
     return hdata;
 }
 
+// Uploads count particles' worth of data into the requested device array (POSITION or
+// VELOCITY) starting at particle index start; for POSITION in OpenGL mode this goes
+// through the VBO rather than a raw CUDA copy.
 void ParticleSystem::setArray(ParticleArray array, const float *data, int start, int count)
 {
     assert(m_bInitialized);
@@ -395,11 +537,15 @@ void ParticleSystem::setArray(ParticleArray array, const float *data, int start,
     }
 }
 
+// Returns a pseudo-random float uniformly distributed in [0, 1).
 inline float frand() { return rand() / (float)RAND_MAX; }
 
+// Populates the host position/velocity arrays with a regular size[0] x size[1] x size[2]
+// lattice of particles (up to numParticles), spaced by spacing and randomly jittered so
+// they don't start in a perfectly aligned, degenerate configuration.
 void ParticleSystem::initGrid(uint *size, float spacing, float jitter, uint numParticles)
 {
-    srand(1973);
+    srand(m_seed);
 
     for (uint z = 0; z < size[2]; z++) {
         for (uint y = 0; y < size[1]; y++) {
@@ -424,6 +570,8 @@ void ParticleSystem::initGrid(uint *size, float spacing, float jitter, uint numP
     }
 }
 
+// Reinitializes all particles' positions/velocities on the host according to config
+// (a uniform random cloud or a regular grid) and uploads the result to the device.
 void ParticleSystem::reset(ParticleConfig config)
 {
     switch (config) {
@@ -460,6 +608,9 @@ void ParticleSystem::reset(ParticleConfig config)
     setArray(VELOCITY, m_hVel, 0, m_numParticles);
 }
 
+// Fills a solid sphere of radius r cells (spaced by spacing, centered at pos, with all
+// particles given initial velocity vel) into the host arrays starting at particle index
+// start, then uploads the affected range to the device.
 void ParticleSystem::addSphere(int start, float *pos, float *vel, int r, float spacing)
 {
     uint index = start;

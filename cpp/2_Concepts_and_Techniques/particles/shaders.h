@@ -25,5 +25,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+// GLSL source for the point-sprite vertex shader (see shaders.cpp for what each does).
 extern const char *vertexShader;
+// GLSL source for the sphere-shading fragment shader (see shaders.cpp for what each does).
 extern const char *spherePixelShader;

@@ -40,6 +40,7 @@
 #define M_PI 3.1415926535897932384626433832795
 #endif
 
+// Initializes default point/sphere rendering parameters and compiles the point-sprite shader program.
 ParticleRenderer::ParticleRenderer()
     : m_pos(0)
     , m_numParticles(0)
@@ -52,20 +53,28 @@ ParticleRenderer::ParticleRenderer()
     _initGL();
 }
 
+// Clears the renderer's cached position pointer (does not own or free it).
 ParticleRenderer::~ParticleRenderer() { m_pos = 0; }
 
+// Stores a pointer to a host-side array of particle positions (used for the non-VBO
+// immediate-mode drawing path in _drawPoints).
 void ParticleRenderer::setPositions(float *pos, int numParticles)
 {
     m_pos          = pos;
     m_numParticles = numParticles;
 }
 
+// Records the OpenGL VBO handle holding particle positions, so _drawPoints can render
+// directly from GPU memory instead of the host-side array.
 void ParticleRenderer::setVertexBuffer(unsigned int vbo, int numParticles)
 {
     m_vbo          = vbo;
     m_numParticles = numParticles;
 }
 
+// Renders all particles as GL_POINTS: falls back to immediate-mode glVertex3fv calls from
+// the host m_pos array if no VBO is set, otherwise binds the position (and color, if set) VBO
+// and issues a single glDrawArrays call.
 void ParticleRenderer::_drawPoints()
 {
     if (!m_vbo) {
@@ -99,6 +108,9 @@ void ParticleRenderer::_drawPoints()
     }
 }
 
+// Draws the particle set in the requested mode: PARTICLE_POINTS renders plain white GL
+// points, while PARTICLE_SPHERES enables point sprites and the compiled shader program
+// (passing in point scale/radius uniforms) so each point is shaded to look like a sphere.
 void ParticleRenderer::display(DisplayMode mode /* = PARTICLE_POINTS */)
 {
     switch (mode) {
@@ -130,6 +142,8 @@ void ParticleRenderer::display(DisplayMode mode /* = PARTICLE_POINTS */)
     }
 }
 
+// Compiles vsource/fsource as a vertex and fragment shader, links them into a program, and
+// returns its GL handle (or 0, printing the link log, on failure).
 GLuint ParticleRenderer::_compileProgram(const char *vsource, const char *fsource)
 {
     GLuint vertexShader   = glCreateShader(GL_VERTEX_SHADER);
@@ -163,6 +177,8 @@ GLuint ParticleRenderer::_compileProgram(const char *vsource, const char *fsourc
     return program;
 }
 
+// Compiles the sphere point-sprite shader program and disables color clamping so shader
+// output isn't clipped to [0,1] on platforms that support it.
 void ParticleRenderer::_initGL()
 {
     m_program = _compileProgram(vertexShader, spherePixelShader);

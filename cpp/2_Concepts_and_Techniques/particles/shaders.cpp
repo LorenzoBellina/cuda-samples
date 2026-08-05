@@ -27,7 +27,9 @@
 
 #define STRINGIFY(A) #A
 
-// vertex shader
+// GLSL vertex shader source: scales each point sprite's on-screen size based on its
+// world-space radius (pointRadius) and distance from the eye, then passes through the
+// vertex's texture coordinate and color for the fragment shader to shade as a sphere.
 const char *vertexShader = STRINGIFY(uniform float pointRadius; // point size in world space
                                      uniform float pointScale;  // scale to calculate size in pixels
                                      uniform float densityScale;
@@ -44,7 +46,9 @@ const char *vertexShader = STRINGIFY(uniform float pointRadius; // point size in
                                          gl_FrontColor = gl_Color;
                                      });
 
-// pixel shader for rendering points as shaded spheres
+// GLSL fragment shader source: reconstructs a per-pixel sphere normal from the point
+// sprite's texture coordinates, discards pixels outside the sprite's circular footprint,
+// and applies simple diffuse lighting to shade each point as a lit sphere.
 const char *spherePixelShader = STRINGIFY(void main() {
     const vec3 lightDir = vec3(0.577, 0.577, 0.577);
 

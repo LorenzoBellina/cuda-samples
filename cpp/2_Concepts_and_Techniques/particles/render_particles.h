@@ -31,21 +31,32 @@
 class ParticleRenderer
 {
 public:
+    // Sets default rendering parameters and compiles the point-sprite shader program.
     ParticleRenderer();
+    // Releases the compiled GLSL shader program.
     ~ParticleRenderer();
 
+    // Uploads a raw host array of particle positions into the renderer's own VBO for drawing.
     void setPositions(float *pos, int numParticles);
+    // Points the renderer at an externally-owned VBO of particle positions (avoids a copy).
     void setVertexBuffer(unsigned int vbo, int numParticles);
+    // Points the renderer at an externally-owned VBO of per-particle colors.
     void setColorBuffer(unsigned int vbo) { m_colorVBO = vbo; }
 
     enum DisplayMode { PARTICLE_POINTS, PARTICLE_SPHERES, PARTICLE_NUM_MODES };
 
+    // Draws all particles using the given display mode (flat GL points or shaded point sprites).
     void display(DisplayMode mode = PARTICLE_POINTS);
+    // Draws a wireframe box outlining the simulation domain/grid bounds.
     void displayGrid();
 
+    // Sets the on-screen point size (in pixels) used when rendering PARTICLE_POINTS.
     void setPointSize(float size) { m_pointSize = size; }
+    // Sets the world-space particle radius used to scale point-sprite size.
     void setParticleRadius(float r) { m_particleRadius = r; }
+    // Sets the camera vertical field of view (degrees), used to scale point-sprite size correctly.
     void setFOV(float fov) { m_fov = fov; }
+    // Sets the current viewport dimensions, used to scale point-sprite size correctly.
     void setWindowSize(int w, int h)
     {
         m_window_w = w;
@@ -53,8 +64,11 @@ public:
     }
 
 protected: // methods
+    // Sets up the GL state (point sprite mode, program) needed before drawing particles.
     void   _initGL();
+    // Issues the actual glDrawArrays call that renders the particles as GL_POINTS.
     void   _drawPoints();
+    // Compiles and links a GLSL vertex+fragment shader program from source strings, returning its handle.
     GLuint _compileProgram(const char *vsource, const char *fsource);
 
 protected: // data
